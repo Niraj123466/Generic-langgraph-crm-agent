@@ -6,16 +6,29 @@ from __future__ import annotations
 
 import asyncio
 
-from agent_config import validate_config
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from agent_core import run_conversation, create_mcp_client, create_agent, refine_prompt
+from agent_core import run_conversation, create_agent, refine_prompt
+from crm_core.loader import load_crm_adapter
+from agent_config import validate_config
 
 
 async def main():
     validate_config()
 
-    client = await create_mcp_client()
-    server_name = "zoho_crm"
+    # Load the active CRM adapter (Zoho, HubSpot, etc.)
+    adapter = load_crm_adapter()
+    print(f"Loaded CRM Adapter: {adapter.get_server_name()}")
+
+    # Configure the MCP client using the adapter's config
+    server_name = adapter.get_server_name()
+    connection_config = adapter.get_connection_config()
+    
+    client = MultiServerMCPClient(
+        connections={
+            server_name: connection_config,
+        }
+    )
 
     async with client.session(server_name) as session:
         tools = await load_mcp_tools(

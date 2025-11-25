@@ -1,79 +1,11 @@
-"""
-LangGraph agent core for the Zoho MCP proof-of-concept.
-"""
-
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools
 
-from agent_config import (
-    GOOGLE_API_KEY,
-    ZOHO_MCP_URL,
-    ZOHO_CLIENT_ID,
-    ZOHO_CLIENT_SECRET,
-    ZOHO_REDIRECT_URI,
-    ZOHO_SCOPE,
-    ZOHO_ACCOUNTS_SERVER,
-)
-from token_manager import ZohoTokenManager
-
-
-def _get_auth_headers() -> Optional[Dict[str, str]]:
-    """
-    Get authentication headers with a valid access token.
-
-    Returns:
-        Dictionary with Authorization header, or None if OAuth is not configured
-    """
-    if not ZOHO_CLIENT_ID or not ZOHO_CLIENT_SECRET:
-        # OAuth not configured, return None (will use URL-based auth if available)
-        return None
-
-    try:
-        token_manager = ZohoTokenManager(
-            client_id=ZOHO_CLIENT_ID,
-            client_secret=ZOHO_CLIENT_SECRET,
-            redirect_uri=ZOHO_REDIRECT_URI or "http://localhost:8080/oauth/callback",
-            scope=ZOHO_SCOPE,
-            accounts_server=ZOHO_ACCOUNTS_SERVER,
-        )
-        access_token = token_manager.get_valid_access_token()
-        return {"Authorization": f"Bearer {access_token}"}
-    except RuntimeError as e:
-        print(f"Warning: Could not get access token: {e}")
-        print("Continuing without Bearer token authentication...")
-        return None
-
-
-async def create_mcp_client() -> MultiServerMCPClient:
-    """
-    Create and return a configured MultiServerMCPClient.
-    """
-    server_name = "zoho_crm"
-
-    # Get authentication headers if OAuth is configured
-    auth_headers = _get_auth_headers()
-
-    # Configure the connection with optional auth headers
-    connection_config: Dict[str, Any] = {
-        "transport": "streamable_http",
-        "url": ZOHO_MCP_URL,
-    }
-
-    if auth_headers:
-        connection_config["headers"] = auth_headers
-
-    client = MultiServerMCPClient(
-        connections={
-            server_name: connection_config,
-        }
-    )
-    return client
+from agent_config import GOOGLE_API_KEY
 
 
 def create_agent(tools: list) -> Any:
