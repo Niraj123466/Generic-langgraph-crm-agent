@@ -1,9 +1,11 @@
 """
 OAuth token manager for Zoho CRM with automatic refresh.
 
-This module handles OAuth 2.0 token acquisition and automatic refresh
-so tokens never expire. It stores tokens securely and refreshes them
-before expiration, requiring manual authentication only once.
+This upgraded version ensures:
+- Access token never expires (auto-refresh before expiration)
+- Refresh token is preserved forever
+- Cleaner error handling
+- Optional "always refresh" mode
 """
 
 from __future__ import annotations
@@ -20,14 +22,17 @@ import httpx
 
 class ZohoTokenManager:
     """
-    Manages Zoho OAuth tokens with automatic refresh.
-
-    Tokens are stored in a local file and automatically refreshed
-    before expiration, ensuring continuous access without manual intervention.
+    Manages Zoho OAuth tokens with safe, automatic refresh.
+    Access token always remains valid, and refresh token is never lost.
     """
 
     TOKEN_FILE = Path(".tokens.json")
-    TOKEN_REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiry
+
+    # Refresh 5 minutes before expiry
+    TOKEN_REFRESH_BUFFER_SECONDS = 300  # refresh 5 minutes early
+
+    # If True → refresh access token for every call (safest)
+    ALWAYS_REFRESH = False
 
     def __init__(
         self,
@@ -37,76 +42,67 @@ class ZohoTokenManager:
         scope: str = "ZohoCRM.modules.ALL",
         accounts_server: str = "https://accounts.zoho.com",
     ):
-        """
-        Initialize the token manager.
-
-        Args:
-            client_id: Zoho OAuth client ID
-            client_secret: Zoho OAuth client secret
-            redirect_uri: OAuth redirect URI (must match Zoho app config)
-            scope: OAuth scope (default: full CRM access)
-            accounts_server: Zoho accounts server URL
-        """
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
         self.scope = scope
         self.accounts_server = accounts_server.rstrip("/")
         self.token_data: Optional[Dict[str, Any]] = None
+
         self._load_tokens()
 
+    # -------------------------------------------------------------------------
+    # TOKEN FILE I/O
+    # -------------------------------------------------------------------------
+
     def _load_tokens(self) -> None:
-        """Load tokens from the local storage file."""
+        """Load tokens from persistent storage."""
         if self.TOKEN_FILE.exists():
             try:
                 with open(self.TOKEN_FILE, "r") as f:
                     self.token_data = json.load(f)
             except (json.JSONDecodeError, IOError) as e:
-                print(f"Warning: Could not load tokens from {self.TOKEN_FILE}: {e}")
+                print(f"Warning: Failed to load tokens: {e}")
                 self.token_data = None
 
     def _save_tokens(self, token_data: Dict[str, Any]) -> None:
-        """Save tokens to the local storage file."""
+        """Save tokens to local storage, ensuring refresh token is preserved."""
+        # Do NOT overwrite refresh token if missing in new response
+        if self.token_data and "refresh_token" in self.token_data:
+            token_data.setdefault("refresh_token", self.token_data["refresh_token"])
+
         self.token_data = token_data
+
         try:
             with open(self.TOKEN_FILE, "w") as f:
                 json.dump(token_data, f, indent=2)
-            # Set restrictive file permissions (owner read/write only)
             os.chmod(self.TOKEN_FILE, 0o600)
         except IOError as e:
             raise RuntimeError(f"Failed to save tokens: {e}") from e
 
-    def get_authorization_url(self) -> str:
-        """
-        Generate the OAuth authorization URL for initial authentication.
+    # -------------------------------------------------------------------------
+    # AUTH URL + INITIAL TOKEN EXCHANGE
+    # -------------------------------------------------------------------------
 
-        Returns:
-            URL to visit in a browser to authorize the application
-        """
+    def get_authorization_url(self) -> str:
+        """Generate OAuth URL for initial login."""
         params = {
             "scope": self.scope,
             "client_id": self.client_id,
             "response_type": "code",
             "redirect_uri": self.redirect_uri,
             "access_type": "offline",
+            "prompt": "consent",  # Ensures refresh token is always issued
         }
         return f"{self.accounts_server}/oauth/v2/auth?{urlencode(params)}"
 
     def exchange_code_for_tokens(self, authorization_code: str) -> Dict[str, Any]:
-        """
-        Exchange an authorization code for access and refresh tokens.
-
-        Args:
-            authorization_code: Authorization code from OAuth callback
-
-        Returns:
-            Token data dictionary with access_token, refresh_token, expires_in, etc.
-        """
+        """Exchange auth code for initial access + refresh tokens."""
         url = f"{self.accounts_server}/oauth/v2/token"
         data = {
             "grant_type": "authorization_code",
             "client_id": self.client_id,
-            "client_secret": self.client_secret,
+            "client_secret": self.client_secret",
             "redirect_uri": self.redirect_uri,
             "code": authorization_code,
         }
@@ -116,96 +112,85 @@ class ZohoTokenManager:
             response.raise_for_status()
             token_data = response.json()
 
-        # Add expiration timestamp for easier checking
+        # Add expiry timestamp
         token_data["expires_at"] = time.time() + token_data.get("expires_in", 3600)
+
+        # Save permanently
         self._save_tokens(token_data)
+
         return token_data
 
+    # -------------------------------------------------------------------------
+    # REFRESH ACCESS TOKEN (FOREVER)
+    # -------------------------------------------------------------------------
+
     def refresh_access_token(self) -> Dict[str, Any]:
-        """
-        Refresh the access token using the refresh token.
-
-        Returns:
-            Updated token data with new access_token and expires_at
-
-        Raises:
-            RuntimeError: If refresh token is missing or refresh fails
-        """
+        """Refresh access token using refresh token."""
         if not self.token_data or "refresh_token" not in self.token_data:
-            raise RuntimeError(
-                "No refresh token available. Please run initial OAuth flow."
-            )
+            raise RuntimeError("Missing refresh token. Run OAuth flow again.")
 
         url = f"{self.accounts_server}/oauth/v2/token"
         data = {
             "grant_type": "refresh_token",
             "client_id": self.client_id,
-            "client_secret": self.client_secret,
+            "client_secret": self.client_secret",
             "refresh_token": self.token_data["refresh_token"],
         }
 
         with httpx.Client() as client:
             response = client.post(url, data=data)
             response.raise_for_status()
-            new_token_data = response.json()
+            new_data = response.json()
 
-        # Preserve refresh token if not returned (some providers don't return it)
-        if "refresh_token" not in new_token_data:
-            new_token_data["refresh_token"] = self.token_data["refresh_token"]
+        # Zoho does NOT return refresh_token on refresh
+        new_data.setdefault("refresh_token", self.token_data["refresh_token"])
 
-        # Update expiration timestamp
-        new_token_data["expires_at"] = time.time() + new_token_data.get(
-            "expires_in", 3600
-        )
-        self._save_tokens(new_token_data)
-        return new_token_data
+        # Set new expiry time
+        new_data["expires_at"] = time.time() + new_data.get("expires_in", 3600)
+
+        # Save safely
+        self._save_tokens(new_data)
+
+        return new_data
+
+    # -------------------------------------------------------------------------
+    # PUBLIC TOKEN ACCESS
+    # -------------------------------------------------------------------------
 
     def get_valid_access_token(self) -> str:
         """
-        Get a valid access token, refreshing if necessary.
-
-        This method ensures the token is always valid by automatically
-        refreshing it before expiration. This is the main method to use
-        for getting tokens in your application.
-
-        Returns:
-            Valid access token string
-
-        Raises:
-            RuntimeError: If tokens are missing or refresh fails
+        Returns a guaranteed-valid access token.
+        It refreshes early so token never expires.
         """
         if not self.token_data or "access_token" not in self.token_data:
             raise RuntimeError(
-                "No access token available. Please run initial OAuth flow:\n"
+                "No access token available. Run initial OAuth flow:\n"
                 f"1. Visit: {self.get_authorization_url()}\n"
-                "2. Authorize the application\n"
-                "3. Copy the 'code' parameter from the redirect URL\n"
+                "2. Authorize\n"
+                "3. Copy ?code=...\n"
                 "4. Call exchange_code_for_tokens(code)"
             )
 
-        # Check if token needs refresh (with buffer time)
         expires_at = self.token_data.get("expires_at", 0)
-        current_time = time.time()
-        buffer_time = expires_at - self.TOKEN_REFRESH_BUFFER_SECONDS
+        now = time.time()
 
-        if current_time >= buffer_time:
-            print("Access token expired or expiring soon. Refreshing...")
+        # ALWAYS refresh mode (safest)
+        if self.ALWAYS_REFRESH:
+            print("[Zoho] Always-refresh mode ON → refreshing token…")
+            self.refresh_access_token()
+            return self.token_data["access_token"]
+
+        # Auto-refresh before expiry buffer
+        if now >= expires_at - self.TOKEN_REFRESH_BUFFER_SECONDS:
+            print("[Zoho] Access token is expiring soon → refreshing…")
             self.refresh_access_token()
 
         return self.token_data["access_token"]
 
     def is_authenticated(self) -> bool:
-        """
-        Check if valid tokens are available.
-
-        Returns:
-            True if tokens exist and are valid, False otherwise
-        """
+        """True if tokens exist and refresh works."""
         try:
             self.get_valid_access_token()
             return True
-        except RuntimeError:
+        except Exception:
             return False
-
-
-
